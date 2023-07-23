@@ -12,7 +12,7 @@ from   pypolyagamma import PyPolyaGamma
 class MixedOutputRFLVM(_BaseRFLVM):
     def __init__(self, rng, data, n_burn, n_iters, latent_dim, n_clusters,
                  n_rffs, dp_prior_obs, dp_df, missing, exposure, gaussian_indices = None,
-                 poisson_indices = None, binomial_indices = None, disp_prior=10., bias_var=10.):
+                 poisson_indices = None, binomial_indices = None, disp_prior=10., bias_var=1.):
         """Initialize Mixed Output RFLVM.
         """
 
@@ -99,7 +99,7 @@ class MixedOutputRFLVM(_BaseRFLVM):
         # Explicitly shape before flattening to ensure elements align.
         LL = 0
         if self.gaussian_indices is not None:
-            C = np.sqrt(np.repeat(self.sigma_y[None, :], self.N, axis=0))/self.exposure_gaussian
+            C = np.sqrt(np.repeat(self.sigma_beta[self.gaussian_indices][None, :], self.N, axis=0))/self.exposure_gaussian
             LL += ag_norm.logpdf(self.Y[:, self.gaussian_indices].flatten()[~self.Y_gaussian_missing],
                                 F[:, self.gaussian_indices].flatten()[~self.Y_gaussian_missing],
                                 C.flatten()[~self.Y_gaussian_missing]).sum()
@@ -126,7 +126,11 @@ class MixedOutputRFLVM(_BaseRFLVM):
         self.B0   = np.eye(self.M + 1)
         self.beta = self.rng.multivariate_normal(self.b0, self.B0,
                                                     size=self.J)
-        self.sigma_y = np.ones(len(self.gaussian_indices)) if self.gaussian_indices is not None else None 
+        self.sigma_beta = np.ones(self.J) ### variance for each of the beta's 
+        self.gamma_a_beta = np.ones(self.J) ### inverse gamma priors
+        self.gamma_b_beta = np.ones(self.J) ### inverse gamma priors
+        
+    
 
         ### logistic model stuff
         self.pg             = PyPolyaGamma()
@@ -138,36 +142,37 @@ class MixedOutputRFLVM(_BaseRFLVM):
         self.omega = np.empty(self.Y[:, self.binomial_indices].shape)
 
     def _sample_mixed_output_beta(self):
-        if self.gaussian_indices is not None:
+        if self.gaussian_indices:
             self._sample_beta_gaussian()
-        if self.poisson_indices is not None:
+        if self.poisson_indices:
             self._sample_beta_poisson()
-        if self.binomial_indices is not None:
+        if self.binomial_indices:
             self._sample_omega()
             self._sample_beta_binomial()
 
     def _sample_beta_gaussian(self):
-        """Gibbs sample `beta` and noise parameter `sigma_y`.
+        """Gibbs sample `beta` and noise parameter `sigma_beta`.
         """
-        J_gauss = len(self.gaussian_indices)
+        I = np.eye(self.M + 1)
         phi_X = self.phi(self.X, self.W, add_bias=True)
-        cov_j = self.B0 + phi_X.T @ phi_X
-        mu_j  = np.tile((self.B0 @ self.b0), (J_gauss, 1)).T + \
-                (phi_X.T @ self.Y[:,self.gaussian_indices])
-        # multi-output generalization of mvn sample code
-        L  = np.linalg.cholesky(cov_j)
-        Z  = self.rng.normal(size=self.beta[self.gaussian_indices,:].shape).T
-        LZ = solve_triangular(L, Z, lower=True, trans='T')
-        L_mu = dpotrs(L, mu_j, lower=True)[0]
-        self.beta[self.gaussian_indices, :] = (LZ + L_mu).T
-        # sample from inverse gamma
         a_post = self.gamma_a0 + .5 * self.N
-        b_post = self.gamma_b0 + .5 * np.diag(
-            (self.Y[:, self.gaussian_indices].T @ self.Y[:, self.gaussian_indices]) + \
-            (self.b0 @ self.B0 @ self.b0.T) + \
-            (mu_j.T @ np.linalg.solve(cov_j, mu_j))
-        )
-        self.sigma_y = 1. / self.rng.gamma(a_post, 1./b_post)
+        R = np.diag(np.power(self.exposure_gaussian[:,0],2)) ### same 
+        Q = -phi_X.T.dot(R)
+        T = Q.dot(Q.T) + I
+        B_n = self.Y[:,self.gaussian_indices].T.dot(R - (Q.T).dot(np.linalg.solve(T, Q))).dot(self.Y[:,self.gaussian_indices]) 
+        phi_x_lambda_y = -Q.dot(self.Y[:,self.gaussian_indices])
+
+        for index in self.gaussian_indices:
+            self.beta[index] = self._sample_gaussian(J = T / self.sigma_beta[index], h = phi_x_lambda_y.T[index] / self.sigma_beta[index])
+
+        # sample from inverse gamma
+        
+        
+
+        b_post = self.gamma_b0 + .5 * np.diagonal(B_n)
+
+        self.sigma_beta[self.gaussian_indices] = 1. / self.rng.gamma(a_post, 1./b_post)
+
     
     def _sample_beta_poisson(self):
         """Compute the maximum a posteriori estimation of `beta`.
@@ -180,7 +185,9 @@ class MixedOutputRFLVM(_BaseRFLVM):
             theta = np.exp(F + self.exposure_poisson)
             LL = ag_poisson.logpmf(self.Y[:, self.poisson_indices].flatten()[~self.Y_poisson_missing],
                                     theta.flatten()[~self.Y_poisson_missing]).sum()
-            LP   = ag_mvn.logpdf(beta, self.b0, self.B0).sum()
+            LP = 0
+            for i in range(J_poiss):
+                LP   += ag_mvn.logpdf(beta[i], self.b0, self.sigma_beta[self.poisson_indices][i]*self.B0).sum()  ### add prior to beta
             return -(LL + LP)
 
         resp = minimize(_neg_log_posterior,
@@ -192,6 +199,16 @@ class MixedOutputRFLVM(_BaseRFLVM):
                         ))
         beta_map = resp.x.reshape(J_poiss, self.M+1)
         self.beta[self.poisson_indices,:] = beta_map
+
+        #### now we update the variances 
+
+        a_post = self.gamma_a_beta[self.poisson_indices] + .5 * (self.M + 1) 
+        b_post = self.gamma_b_beta[self.poisson_indices]  + (np.diagonal(beta_map.dot(beta_map.T))) * .5
+
+        self.sigma_beta[self.poisson_indices] = 1/self.rng.gamma(a_post, 1/b_post)
+
+
+
     
     def _sample_beta_binomial(self):
         """Sample `β|ω ~ N(m, V)`. See (Polson 2013).
@@ -201,11 +218,17 @@ class MixedOutputRFLVM(_BaseRFLVM):
         for i,j in enumerate(self.binomial_indices):
             # This really computes: phi_X.T @ np.diag(omega[:, j]) @ phi_X
             J = (phi_X * self.omega[:, i][:, None]).T @ phi_X + \
-                self.inv_B
-            h = phi_X.T @ self._kappa_func(i) + self.inv_B_b
+                (self.inv_B * self.sigma_beta[j])
+            h = phi_X.T @ self._kappa_func(i) + (self.inv_B_b * self.sigma_beta[j])
             joint_sample = self._sample_gaussian(J=J, h=h)
             self.beta[j] = joint_sample
-    
+
+        ### update the variances 
+        a_post = self.gamma_a_beta[self.binomial_indices] + .5 * (self.M + 1) 
+        b_post = self.gamma_b_beta[self.binomial_indices]  + np.diagonal(self.beta[self.binomial_indices,:].dot(self.beta[self.binomial_indices,:].T)) * .5
+
+        self.sigma_beta[self.binomial_indices] = 1/self.rng.gamma(a_post, 1/b_post)
+
     def _a_func(self, j=None):
         """See parent class.
         """
